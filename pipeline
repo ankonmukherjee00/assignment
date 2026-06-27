@@ -1,0 +1,80 @@
+pipeline {
+    agent any
+    environment {
+        AWS_REGION = "ap-south-1"
+        ACCOUNT_ID = "354354997885"
+        ECR_REPO = "flask-app"
+        IMAGE_TAG = "latest"
+        ECR_URI = "${ACCOUNT_ID}.dkr.ecr.${AWS_REGION}.amazonaws.com/${ECR_REPO}"
+        EC2_HOST = "15.207.128.11"
+    }
+    stages {
+        stage('Checkout Code') {
+            steps {
+                git branch: 'main',
+                    credentialsId: 'github-ssh',
+                    url: 'git@github.com:ankonmukherjee00/assignment.git'
+            }
+        }
+
+        stage('Build Docker Image') {
+            steps {
+                bat "docker build -t %ECR_REPO%:%IMAGE_TAG% app"
+            }
+        }
+
+        stage('Assume Role & Push to ECR') {
+            steps {
+                withCredentials([[
+                    $class: 'AmazonWebServicesCredentialsBinding',
+                    credentialsId: 'aws-credentials',
+                    accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                    secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+                ]]) {
+                    bat """
+                    @echo off
+                    aws sts assume-role --role-arn arn:aws:iam::%ACCOUNT_ID%:role/cicd-role --role-session-name jenkins-session --query Credentials --output json > creds.json
+
+                    for /f "usebackq tokens=*" %%a in (`jq -r .AccessKeyId creds.json`) do set AWS_ACCESS_KEY_ID=%%a
+                    for /f "usebackq tokens=*" %%a in (`jq -r .SecretAccessKey creds.json`) do set AWS_SECRET_ACCESS_KEY=%%a
+                    for /f "usebackq tokens=*" %%a in (`jq -r .SessionToken creds.json`) do set AWS_SESSION_TOKEN=%%a
+
+                    aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %ACCOUNT_ID%.dkr.ecr.%AWS_REGION%.amazonaws.com
+
+                    docker tag %ECR_REPO%:%IMAGE_TAG% %ECR_URI%:%IMAGE_TAG%
+                    docker push %ECR_URI%:%IMAGE_TAG%
+
+                    del creds.json
+                    """
+                }
+            }
+        }
+
+        stage('Deploy to EC2') {
+    steps {
+        withCredentials([
+            sshUserPrivateKey(credentialsId: 'ec2-ssh-key', keyFileVariable: 'SSH_KEY'),
+            [
+                $class: 'AmazonWebServicesCredentialsBinding',
+                credentialsId: 'aws-credentials',
+                accessKeyVariable: 'AWS_ACCESS_KEY_ID',
+                secretKeyVariable: 'AWS_SECRET_ACCESS_KEY'
+            ]
+        ]) {
+            bat """
+            @echo off
+            aws sts assume-role --role-arn arn:aws:iam::%ACCOUNT_ID%:role/cicd-role --role-session-name jenkins-deploy --query Credentials --output json > creds.json
+
+            for /f "usebackq tokens=*" %%a in (`jq -r .AccessKeyId creds.json`) do set AWS_ACCESS_KEY_ID=%%a
+            for /f "usebackq tokens=*" %%a in (`jq -r .SecretAccessKey creds.json`) do set AWS_SECRET_ACCESS_KEY=%%a
+            for /f "usebackq tokens=*" %%a in (`jq -r .SessionToken creds.json`) do set AWS_SESSION_TOKEN=%%a
+
+            ssh -o StrictHostKeyChecking=no -i %SSH_KEY% ubuntu@%EC2_HOST% "aws ecr get-login-password --region %AWS_REGION% | docker login --username AWS --password-stdin %ECR_URI% && docker stop flask-app || true && docker rm flask-app || true && docker pull %ECR_URI%:%IMAGE_TAG% && docker run -d --name flask-app -p 5000:5000 %ECR_URI%:%IMAGE_TAG%"
+
+            del creds.json
+            """
+        }
+    }
+}
+        }
+    }
